@@ -1,0 +1,97 @@
+name: Flutter and Web Build
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "Unique bot job ID"
+        required: true
+        type: string
+      mode:
+        description: "flutter or web"
+        required: true
+        type: choice
+        options: [flutter_release, flutter_debug, web]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout builder repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Download source from repository tree
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          mkdir -p input
+          python3 - <<'PY'
+          import os, json, urllib.request, base64, pathlib
+          token=os.environ["GH_TOKEN"]; job=os.environ["JOB_ID"]
+          repo=os.environ["GITHUB_REPOSITORY"]; branch=os.environ["GITHUB_REF_NAME"]
+          api=f"https://api.github.com/repos/{repo}/git/trees/{branch}?recursive=1"
+          req=urllib.request.Request(api,headers={"Authorization":f"Bearer {token}","Accept":"application/vnd.github+json"})
+          tree=json.load(urllib.request.urlopen(req))["tree"]
+          prefix=f".build-inputs/{job}/"
+          files=[x for x in tree if x["type"]=="blob" and x["path"].startswith(prefix)]
+          if not files: raise SystemExit("No input files found for job "+job)
+          for item in files:
+            rel=item["path"][len(prefix):]
+            url=f"https://api.github.com/repos/{repo}/git/blobs/{item['sha']}"
+            req=urllib.request.Request(url,headers={"Authorization":f"Bearer {token}","Accept":"application/vnd.github+json"})
+            blob=json.load(urllib.request.urlopen(req))
+            data=base64.b64decode(blob["content"])
+            dest=pathlib.Path("input")/rel; dest.parent.mkdir(parents=True,exist_ok=True); dest.write_bytes(data)
+          PY
+      - name: Detect project root
+        run: |
+          ROOT="$(find input -name pubspec.yaml -printf '%h\n' | head -n1)"
+          if [ -z "$ROOT" ]; then ROOT="input"; fi
+          echo "PROJECT_ROOT=$ROOT" >> "$GITHUB_ENV"
+      - name: Build Flutter APK
+        if: inputs.mode == 'flutter_release' || inputs.mode == 'flutter_debug'
+        run: |
+          cd "$PROJECT_ROOT"
+          flutter pub get
+          if [ "${{ inputs.mode }}" = "flutter_debug" ]; then
+            flutter build apk --debug
+          else
+            flutter build apk --release
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          cp build/app/outputs/flutter-apk/*.apk "$GITHUB_WORKSPACE/output/"
+      - name: Build Web
+        if: inputs.mode == 'web'
+        run: |
+          if [ -f "$PROJECT_ROOT/pubspec.yaml" ]; then
+            cd "$PROJECT_ROOT"
+            flutter pub get
+            flutter build web --release
+            mkdir -p "$GITHUB_WORKSPACE/output"
+            cp -r build/web/. "$GITHUB_WORKSPACE/output/"
+          else
+            mkdir -p "$GITHUB_WORKSPACE/output"
+            cp -r input/. "$GITHUB_WORKSPACE/output/"
+          fi
+      - name: Upload build artifact
+        if: always() && hashFiles('output/**') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ inputs.job_id }}
+          path: output/
+          if-no-files-found: warn
+          retention-days: 2
